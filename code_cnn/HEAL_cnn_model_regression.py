@@ -13,6 +13,7 @@ import nibabel as nib
 import numpy as np
 from sklearn.metrics import r2_score
 import re, glob, os
+import random
 
 # Define CNN model
 import torch
@@ -23,13 +24,13 @@ class CNN3D(nn.Module):
     def __init__(self, output_dim, input_shape):
         super(CNN3D, self).__init__()
         
-        self.conv1 = nn.Conv3d(in_channels=1, out_channels=32, kernel_size=3, stride=2, padding=1)
+        self.conv1 = nn.Conv3d(in_channels=1, out_channels=16, kernel_size=3, stride=1, padding=1)
         self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2, padding=0)
         
-        self.conv2 = nn.Conv3d(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1)
+        self.conv2 = nn.Conv3d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1)
         self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2, padding=0)
         
-        self.conv3 = nn.Conv3d(in_channels=64, out_channels=128, kernel_size=3, stride=2, padding=1)
+        self.conv3 = nn.Conv3d(in_channels=32, out_channels=64, kernel_size=3, stride=1, padding=1)
         self.pool3 = nn.MaxPool3d(kernel_size=2, stride=2, padding=0)
         self.flatten = nn.Flatten()
         flattened_size = self._get_flattened_size(input_shape)
@@ -127,7 +128,16 @@ class LinearRegressionNetwork(nn.Module):
         x = self.fc3(x)
         return x
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device):
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, SEED=42):
+    # set initialization
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    np.random.seed(SEED)
+    random.seed(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     model.to(device)
     best_val_loss = np.inf
     for epoch in range(num_epochs):
@@ -181,6 +191,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     return model
 
 def evaluate_model(model, test_loader, criterion, device):
+    model.to(device)
     model.eval()
     test_loss = 0.0
     test_r2 = 0.0
@@ -221,7 +232,7 @@ def count_params(model):
     print(f"Trainable Parameters: {trainable_params}")
 
 
-def fine_tune_cnn3d(pretrained_model, new_input_dim, new_output_dim, latent_dim=512):
+def fine_tune_cnn3d(pretrained_model, new_input_dim, new_output_dim, latent_dim=256):
     # Load the model state
     model = pretrained_model
     
@@ -246,11 +257,11 @@ def get_path_and_shape(which_data, project_dir):
         data_file_name = 'sub-*_stat-z_reg-stimulation_gm_masked.nii.gz'
     elif which_data == 't1_1mm':
         data_shape = (193, 229, 193)
-        data_dir = f'{project_dir}/MRI_structural_1mm/*/ses-01/anat/'
+        data_dir = f'{project_dir}/MRI_structural_1mm/sub-*/ses-01/anat/'
         data_file_name = 'sub-*_ses-01_space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz'
     elif which_data == 't1_2mm':
         data_shape = (91, 109, 91)
-        data_dir = f'{project_dir}/MRI_structural_2mm/*/ses-01/anat/'
+        data_dir = f'{project_dir}/MRI_structural_2mm/sub-*/ses-01/anat/'
         data_file_name = 'sub-*_ses-01_space-MNI152NLin6Asym_res-2_desc-preproc_T1w.nii.gz'
     elif which_data == 'ukb_t1':
         data_shape = (92, 110, 92)
@@ -260,29 +271,35 @@ def get_path_and_shape(which_data, project_dir):
         raise Exception('which_data must be either "pressure" or "t1_1mm" or "t1_2mm", "ukb_t1" ')
     
     return data_dir, data_file_name, data_shape
-def get_nifti_path(which_data, CP_df, project_dir):
-    data_dir, data_file_name, data_shape = get_path_and_shape(which_data, project_dir)
-    print('data_dir:', data_dir, '\ndata_file_name:', data_file_name, '\ndata_shape:', data_shape)
-    # include rest run 1 and run 2
 
-    augmented_df = pd.DataFrame(columns=CP_df.columns.to_list() + ['nifti_path'])
+def get_nifti_path(which_data, CP_df, project_dir, create= True):
+    if create:
+        data_dir, data_file_name, data_shape = get_path_and_shape(which_data, project_dir)
+        print('data_dir:', data_dir, '\ndata_file_name:', data_file_name, '\ndata_shape:', data_shape)
+        # include rest run 1 and run 2
+        augmented_df = CP_df.copy()
+        augmented_df['nifti_path'] = None
 
-    
-    for f in np.sort(glob.glob(os.path.join(data_dir, data_file_name))):
-        if nib.load(f).shape != data_shape:
-            print(f'Error: {f} has shape {nib.load(f).shape} . Skipping...')
-            continue
-        else:
-            s = os.path.basename(f).split('sub-')[1].split('_')[0]
-            df = CP_df[CP_df['subject_id']==s]
-            df['nifti_path'] = f
-            augmented_df = pd.concat([augmented_df, df])
-
-    augmented_df.reset_index(drop=True, inplace=True)
+        for s in augmented_df['subject_id']:
+            f = os.path.join(data_dir, data_file_name).replace('*', s)
+            if not os.path.exists(f):
+                augmented_df = augmented_df[augmented_df['subject_id']!=s]
+                
+            else:
+                if nib.load(f).shape != data_shape:
+                    print(f'Error: {f} has shape {nib.load(f).shape} . Skipping...')
+                    continue
+                else:
+                    augmented_df.loc[augmented_df['subject_id']==s, 'nifti_path'] = f
+        
+        augmented_df.reset_index(drop=True, inplace=True)
+        augmented_df.to_csv(f'{project_dir}/HEAL_labels/labels-{which_data}_filecheck.csv', index=False)
+    else:
+        augmented_df = pd.read_csv(f'{project_dir}/HEAL_labels/labels_{which_data}_filecheck.csv')
 
     return augmented_df 
 
-def get_ukb_nifti_path(project_dir, create=True, which_subset='all'):
+def get_ukb_nifti_path(project_dir, create=True, which_subset='all', which_res='2mm'):
     
     if which_subset == '_cp':
         if create:
@@ -290,7 +307,7 @@ def get_ukb_nifti_path(project_dir, create=True, which_subset='all'):
             augmented_df = pd.read_csv(f'{project_dir}/ukb_labels/ukb_labels_cp.csv')
             augmented_df['nifti_path'] = None
             for s in augmented_df['eid']:
-                file_path = f'{project_dir}/uk_biobank/sub-{s}/ses-2_0/anat/sub-{s}_ses-2_0_desc-preproc_T1w_brain_space-2mm_MNI.nii.gz'
+                file_path = f'{project_dir}/uk_biobank/sub-{s}/ses-2_0/anat/sub-{s}_ses-2_0_desc-preproc_T1w_brain_space-{which_res}_MNI.nii.gz'
                 augmented_df.loc[augmented_df['eid']==s, 'nifti_path'] = file_path
                 # if there is no nifti file, remove the row
                 if not os.path.exists(file_path):
@@ -306,7 +323,7 @@ def get_ukb_nifti_path(project_dir, create=True, which_subset='all'):
             augmented_df = pd.read_csv(f'{project_dir}/ukb_labels/ukb_labels.csv')
             augmented_df['nifti_path'] = None
             for s in augmented_df['eid']:
-                file_path = f'{project_dir}/uk_biobank/sub-{s}/ses-2_0/anat/sub-{s}_ses-2_0_desc-preproc_T1w_brain_space-2mm_MNI.nii.gz'
+                file_path = f'{project_dir}/uk_biobank/sub-{s}/ses-2_0/anat/sub-{s}_ses-2_0_desc-preproc_T1w_brain_space-{which_res}_MNI.nii.gz'
                 augmented_df.loc[augmented_df['eid']==s, 'nifti_path'] = file_path
                 # if there is no nifti file, remove the row
                 if not os.path.exists(file_path):
@@ -329,14 +346,15 @@ def main(which_data='t1_2mm', num_epochs=50, y_variable = 'TScore', train_from_s
     # Create DataFrame
     which_subset = 'all'
     if 'ukb' in which_data:
-        augmented_df = get_ukb_nifti_path(project_dir, create=False, which_subset=which_subset)
+        augmented_df = get_ukb_nifti_path(project_dir, create=False, which_subset=which_subset, which_res='2mm')
         print(augmented_df)
+        print(f'resolution=2mm, which_subset={which_subset}')
     else:    
         demographics = pd.read_csv(f'{project_dir}/HEAL_labels/participants_demographics.csv')
         label_df = pd.read_csv(f'{project_dir}/HEAL_labels/labels.csv')
         label_df = label_df[label_df.session == 'baseline']
         CP_df = pd.merge(label_df, demographics, on='subject_id')
-        augmented_df = get_nifti_path(which_data, CP_df, project_dir)
+        augmented_df = get_nifti_path(which_data, CP_df, project_dir, create=True)
     # Create DataLoaders for 'target_variable' column (replace with your regression target column)
     new_output_dim=1
     print('y_variable:', y_variable)
@@ -392,35 +410,68 @@ def main(which_data='t1_2mm', num_epochs=50, y_variable = 'TScore', train_from_s
             raise Exception('Must have test split to evaluate the model')
         else:
             # Dynamically compute the flattened size
-            data_dir, data_file_name, data_shape = get_path_and_shape(which_data, project_dir)
-            model = CNN3D(output_dim=output_dim, input_shape=data_shape)
-            flattened_size = model._get_flattened_size(data_shape)
+            _, _, pretrained_data_shape = get_path_and_shape('ukb_t1', project_dir)
+            output_dim = 1
+            model = CNN3D(output_dim=output_dim, input_shape=pretrained_data_shape)
             model = model.to(device)  # Move model to GPU if available
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            
 
             count_params(model)
 
             model.load_state_dict(torch.load(pretrained_model, map_location=torch.device('cpu')))
+            # get the new data shape
+            _, _, data_shape = get_path_and_shape(which_data, project_dir)
+            model_size = CNN3D(output_dim=output_dim, input_shape=data_shape)
+            flattened_size = model_size._get_flattened_size(data_shape)
+            del model_size # delete to save memory
+            
+            # replace the last fc layers with new input dim
             trained_model = fine_tune_cnn3d(model, new_input_dim=flattened_size, new_output_dim=new_output_dim)
+            optimizer = optim.Adam(trained_model.parameters(), lr=0.001)
             print('load pretrained 3dcnn')
             count_params(trained_model)
+
+            print('initial transfer performance without fine-tuning')
+            evaluate_model(trained_model, test_loader, criterion, device)
             fine_tune_model = train_model(trained_model, 
                                     train_loader, 
                                     val_loader, 
                                     criterion, 
                                     optimizer, 
-                                    num_epochs=10,
+                                    num_epochs=100,
                                     device=device)
             
-            evaluate_model(fine_tune_model, test_loader, criterion, device)
+            test_loss, test_r2, test_corr, test_outputs, test_labels = evaluate_model(fine_tune_model, test_loader, criterion, device)
+        
+            # convert to AUC
+            from sklearn.metrics import roc_auc_score
+            # if test_labels > 64, then1, else 0
+            test_groups = np.where(np.array(test_labels) >= auc_threshold, 1, 0)
+            test_auc = roc_auc_score(test_groups, test_outputs)
+            # save test_outputs, test_labels in a csv
+            test_df = pd.DataFrame({'test_outputs': test_outputs, 'test_labels': test_labels})
+            test_df.to_csv(f'{project_dir}/models_save/pretrained_cnn3d_regression_{which_data}_y-{y_variable}_test.csv', index=False)
+            print(f'Test AUC: {test_auc:.4f}')
+
 
 if __name__ == '__main__':
-    main(which_data = 'ukb_t1', 
+        # main(which_data = 'ukb_t1', 
+        # num_epochs=100, 
+        # y_variable='BMI',
+        # batch_size=16, 
+        # val_split=0.2, 
+        # test_split=0, 
+        # train_from_scratch = True, 
+        # pretrained_model=None, 
+        # auc_threshold=64)
+
+
+    main(which_data = 't1_1mm', 
         num_epochs=100, 
-        y_variable='BMI',
+        y_variable='TScore',
         batch_size=16, 
         val_split=0.2, 
-        test_split=0, 
-        train_from_scratch = True, 
-        pretrained_model=None, 
-        auc_threshold=24)
+        test_split=0.1, 
+        train_from_scratch = False, 
+        pretrained_model='/home/yiyuw/projects/MRI_TransferLearning/models_save/cnn3d_regression_ukb_t1_y-BMI_subset-all.pt', 
+        auc_threshold=65)
