@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 '''
-run LSTM models on resting state of HEAL from scratch
+run LSTM models on resting state of ukb as a pretrained model
 '''
 
 #import pandas as pd
@@ -95,7 +95,7 @@ class CustomRSFCMDataset(Dataset):
             y = self.target_transform(y)
         return X, y
     
-def ParcelFileToTensor(parcel_file_list, NROI, transform = None, network = None):
+def ParcelFileToTensor(parcel_file_list, NROI, rs_timepoint = 750, transform = None, network = None):
     """
     Convert pregenerated parcellation files to tensor
 
@@ -115,8 +115,8 @@ def ParcelFileToTensor(parcel_file_list, NROI, transform = None, network = None)
     for parcellation_path in parcel_file_list:
         par_df =pd.read_csv(parcellation_path)
         
-        if par_df.shape[0] != 750:
-            raise ValueError(f'Error: {parcellation_path} has {par_df.shape[0]} time points, not 750')
+        if par_df.shape[0] != rs_timepoint:
+            raise ValueError(f'Error: {parcellation_path} has {par_df.shape[0]} time points, not {rs_timepoint}')
         else: 
             # Lesion first:
             if network:
@@ -152,7 +152,6 @@ class LSTMWithTransformer(nn.Module):
         )
 
         self.dropout_layer = nn.Dropout(dropout_layer)
-   
         self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
@@ -164,6 +163,7 @@ class LSTMWithTransformer(nn.Module):
         # Apply global average pooling
         context_vector = torch.mean(transformer_out, dim=1)
         context_vector = self.dropout_layer(context_vector)
+
         
         # Output layer
         output = self.fc(context_vector)
@@ -258,7 +258,6 @@ class BLSTN(nn.Module):
         out = self.fc(torch.cat((h[-2], h[-1]), dim=1))  # Concatenate the hidden states from both directions
         return out
     
-  
     
 
 
@@ -314,10 +313,10 @@ def train_LSTN(model_name, X_train, y_train, X_test, y_test, input_size, hidden_
         for X, y in tqdm(train_dataloader):
             X = X.to(device)
             y = y.to(device)
-            
             optimizer.zero_grad()
             
             outputs = model(X.float())
+
             loss = criterion(outputs.squeeze(), y.float())
             loss.backward()
             optimizer.step()
@@ -358,7 +357,7 @@ def train_LSTN(model_name, X_train, y_train, X_test, y_test, input_size, hidden_
         test_df['y'] = y.detach().cpu().numpy()
         test_df.to_csv(f'{save_model_dir}/test_df_pred_epoch-{epoch+1}.csv', index=False)
         # save the model
-        if (epoch+1) % 20 == 0:
+        if (epoch+1) % 5 == 0:
             results_file_name = f'{save_model_dir}/model-{model_name}_{ROI_scheme}_hidden-{hidden_size}_batch-{batch_size}_lr-{lr}_epoch-{epoch+1}_dropout-{dropout}_seed-{SEED}'
             torch.save(model.state_dict(), f'{results_file_name}.pt')
 
@@ -405,12 +404,63 @@ def count_params(model):
     print(f"Total Parameters: {total_params}")
     print(f"Trainable Parameters: {trainable_params}")
 
+def create_labels_df(data_set, data_dir, ROI_scheme, project_dir='/home/yiyuw/projects/HEAL', create=True):
+    if data_set == 'HEAL':
+        print(f'using ROI scheme - {ROI_scheme}')
+        # device = rank #device = torch.device(f"cuda:{rank}")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        warnings.filterwarnings('ignore')
+
+        label_df = pd.read_csv(f'{project_dir}/labels.csv')
+
+        demographics = pd.read_csv(f'{project_dir}/participants_demographics.csv')
+
+        label_df = pd.read_csv(f'{project_dir}/labels.csv')
+        label_df = label_df[label_df.session == 'baseline']
+        CP_df = pd.merge(label_df, demographics, on='subject_id')
+        # include rest run 1 and run 2
+        augmented_df = pd.DataFrame(columns=CP_df.columns.to_list() + ['run', 'file'])
+        for f in np.sort(glob.glob(f'{data_dir}/{ROI_scheme}/*task-rest*')):
+            if pd.read_csv(f).shape[0] != 750:
+                print(f'Error: {f} has {pd.read_csv(f).shape[0]} time points, not 750. Skipping...')
+                continue
+            else:
+                s = re.search(r'sub-(\w+)_task-rest_run-(\d+)_parcellation', f).group(1)
+                run = re.search(r'sub-(\w+)_task-rest_run-(\d+)_parcellation', f).group(2)
+                df = CP_df[CP_df['subject_id']==s]
+                df['run'] = run
+                df['file'] = f
+                augmented_df = pd.concat([augmented_df, df])
+        # choose run or runs:
+        augmented_df = augmented_df.loc[augmented_df['run'].isin(['1', '2'])]        
+        augmented_df.reset_index(drop=True, inplace=True)
+    elif data_set == 'UKB':
+        if create:  
+            print('making new labels file for ukb')
+            augmented_df = pd.read_csv(f'{project_dir}/ukb_labels/ukb_labels.csv')
+            augmented_df['file'] = None
+            for s in augmented_df['eid']:
+                file_path = f"{data_dir}/{ROI_scheme}/sub-{s}_task-rest_parcellation-{ROI_scheme}.csv"
+                augmented_df.loc[augmented_df['eid']==s, 'file'] = file_path
+                # if there is no nifti file, remove the row (i.e., this subject)
+                if not os.path.exists(file_path):
+                    print(f'removing {s} from the dataframe')
+                    augmented_df = augmented_df[augmented_df['eid']!=s]
+            augmented_df.reset_index(drop=True, inplace=True)
+            # rename eid column to subject_id
+            augmented_df.rename(columns={'eid':'subject_id'}, inplace=True)
+            # save to csv
+            augmented_df.to_csv(f'{project_dir}/ukb_labels/ukb_labels_filecheck.csv', index=False)
+        else:
+            augmented_df = pd.read_csv(f'{project_dir}/ukb_labels/ukb_labels_filecheck.csv')
+    return augmented_df
+
 def main(
     hidden_size = 128,
     batch_size = 16,
     model_name = 'LSTN',
     ROI_scheme = 'schaefer100',
-    n_ep = 100,
+    n_ep = 10,
     lr=0.001, 
     y_variable='group', 
     dropout=0.2, 
@@ -419,49 +469,24 @@ def main(
     num_layers=2,
     SEED = 2024):
 
+
     
     project_dir = '/home/yiyuw/projects/HEAL'
-
-    data_dir = f'{project_dir}/parcellations'
-    confounds_dir = f'{project_dir}/confounds'
-    mask_img = f'{project_dir}/masks/tpl-MNI152NLin6Asym_res-02_desc-brain_mask.nii'
-
-
-    print(f'using ROI scheme - {ROI_scheme}')
-
-    # device = rank #device = torch.device(f"cuda:{rank}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    warnings.filterwarnings('ignore')
-
-    label_df = pd.read_csv(f'{project_dir}/labels.csv')
-
-    demographics = pd.read_csv(f'{project_dir}/participants_demographics.csv')
-
-    label_df = pd.read_csv(f'{project_dir}/labels.csv')
-    label_df = label_df[label_df.session == 'baseline']
-    CP_df = pd.merge(label_df, demographics, on='subject_id')
-
-
-    # include rest run 1 and run 2
-    augmented_df = pd.DataFrame(columns=CP_df.columns.to_list() + ['run', 'file'])
-    for f in np.sort(glob.glob(f'{data_dir}/{ROI_scheme}/*task-rest*')):
-        if pd.read_csv(f).shape[0] != 750:
-            print(f'Error: {f} has {pd.read_csv(f).shape[0]} time points, not 750. Skipping...')
-            continue
-        else:
-            s = re.search(r'sub-(\w+)_task-rest_run-(\d+)_parcellation', f).group(1)
-            run = re.search(r'sub-(\w+)_task-rest_run-(\d+)_parcellation', f).group(2)
-            df = CP_df[CP_df['subject_id']==s]
-            df['run'] = run
-            df['file'] = f
-            augmented_df = pd.concat([augmented_df, df])
-   
-    # choose run or runs:
-    augmented_df = augmented_df.loc[augmented_df['run'].isin(['1', '2'])]        
-    augmented_df.reset_index(drop=True, inplace=True)
+    data_set = 'UKB'
     
-    cv_test_auc_list, cv_test_accuracy_list = [], []
+    if data_set == 'HEAL':
+        data_dir = f'{project_dir}/parcellations'
+        rs_timepioint = 750
+    elif data_set == 'UKB':    
+        data_dir = f'{project_dir}/ukb_parcellations'
+        rs_timepioint = 490
+    else:
+        data_dir = f'{project_dir}/parcellations'
 
+    mask_img = f'{project_dir}/masks/tpl-MNI152NLin6Asym_res-02_desc-brain_mask.nii'
+    augmented_df = create_labels_df(data_set,data_dir, ROI_scheme)
+    cv_test_auc_list, cv_test_accuracy_list = [], []
+    print(augmented_df)
     # make X
     X, y = [], []
     for i, row in augmented_df.iterrows():
@@ -480,7 +505,7 @@ def main(
     
 
     # Initialize a new wandb run
-    project_name = "heal_rs_lstm_experiment_v8"
+    project_name = f"{data_set}_rs_lstm_experiment_v1"
     config_args = {'hidden_size': hidden_size, 'batch_size': batch_size, 'model_name': model_name, 'ROI_scheme': ROI_scheme, 'lr': lr, 'num_heads': num_heads, 'num_layers': num_layers, 'dropout': dropout, 'dropout_layer': dropout_layer, 'SEED': SEED, 'n_ep': n_ep}
     run = wandb.init(config=config_args,
         project=project_name,
@@ -491,7 +516,7 @@ def main(
 
     # split based on participants
     subjects_list = np.unique(augmented_df['subject_id'].values).tolist()
-    train_sub_idx, test_sub_idx = train_test_split(subjects_list, test_size=0.3, random_state=SEED)
+    train_sub_idx, test_sub_idx = train_test_split(subjects_list, test_size=0.2, random_state=SEED)
     # find the indices of the subjects in the augmented_df
     train_idx = augmented_df[augmented_df['subject_id'].isin(train_sub_idx)].index
     test_idx = augmented_df[augmented_df['subject_id'].isin(test_sub_idx)].index
@@ -500,13 +525,14 @@ def main(
     X_train_sub = np.array(X)[train_idx.astype(int)]
     X_test_sub = np.array(X)[test_idx.astype(int)]
 
-    # make X_train and X_test
-    X_train = ParcelFileToTensor(X_train_sub, NROI)
-    X_test = ParcelFileToTensor(X_test_sub, NROI)
+    # # make X_train and X_test
+    X_train = ParcelFileToTensor(X_train_sub, NROI, rs_timepoint=rs_timepioint)
+    X_test = ParcelFileToTensor(X_test_sub, NROI, rs_timepoint=rs_timepioint)
 
     y_train = torch.tensor(y[train_idx.astype(int)])
     y_test = torch.tensor(y[test_idx.astype(int)])
-
+    
+    
     # save the train_df, and test_df
     train_df = augmented_df.loc[train_idx].to_csv(f'{save_model_dir}/train_df.csv', index=False)
     test_df = augmented_df.loc[test_idx].to_csv(f'{save_model_dir}/test_df.csv', index=False)
@@ -540,15 +566,15 @@ if __name__ == "__main__":
     # 'SEED': [42, 5],
     # }
     params_dict = {
-    'hidden_size': [256, 128],
-    'batch_size': [16, 8],
-    'model_name': ['LSTMWithTransformer', 'BiLSTMWithTransformer'],
-    'ROI_scheme': ['schaefer400'],
-    'lr': [0.00001],
+    'hidden_size': [128],
+    'batch_size': [8],
+    'model_name': ['BiLSTMWithTransformer'],
+    'ROI_scheme': ['schaefer100'],
+    'lr': [0.0001],
     'num_heads': [8],
     'num_layers': [2],
-    'dropout': [0],
-    'dropout_layer': [0.5],
+    'dropout': [0.3],
+    'dropout_layer': [0.2],
     'SEED': [42],
     }
 
@@ -562,13 +588,12 @@ if __name__ == "__main__":
         hidden_size, batch_size, model_name, ROI_scheme, lr, num_heads, num_layers, dropout, dropout_layer, SEED = params
         print(f'hidden_size: {hidden_size}, batch_size: {batch_size}, model_name: {model_name}, ROI_scheme: {ROI_scheme}, lr: {lr}, num_heads: {num_heads}, num_layers: {num_layers}, dropout: {dropout}, dropout_layer: {dropout_layer}, SEED: {SEED}')
         
-
         main(
         hidden_size = hidden_size,
         batch_size = batch_size,
         model_name = model_name,
         ROI_scheme = ROI_scheme,
-        n_ep = 200,
+        n_ep = 100,
         lr=lr, 
         y_variable='group', 
         dropout=dropout, 

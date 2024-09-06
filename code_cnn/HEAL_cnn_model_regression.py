@@ -15,15 +15,10 @@ from sklearn.metrics import r2_score
 import re, glob, os
 import random
 
-# Define CNN model
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 import wandb
 
 class CNN3D(nn.Module):
-    def __init__(self, output_dim, input_shape, stride_list = [1,1,1], out_channels_list = [16, 32, 64], dropout=0.5, latent_dim=256):
+    def __init__(self, output_dim, input_shape, stride_list=[1,1,1,1,1], out_channels_list=[16, 32, 64, 128, 256], dropout=0.5, latent_dim=256):
         super(CNN3D, self).__init__()
         
         self.conv1 = nn.Conv3d(in_channels=1, out_channels=out_channels_list[0], kernel_size=3, stride=stride_list[0], padding=1)
@@ -34,10 +29,19 @@ class CNN3D(nn.Module):
         
         self.conv3 = nn.Conv3d(in_channels=out_channels_list[1], out_channels=out_channels_list[2], kernel_size=3, stride=stride_list[2], padding=1)
         self.pool3 = nn.MaxPool3d(kernel_size=2, stride=2, padding=0)
+
+        ################ add more layers: ####################
+        self.conv4 = nn.Conv3d(in_channels=out_channels_list[2], out_channels=out_channels_list[3], kernel_size=3, stride=stride_list[3], padding=1)
+        self.pool4 = nn.MaxPool3d(kernel_size=2, stride=2, padding=0)
+        
+        self.conv5 = nn.Conv3d(in_channels=out_channels_list[3], out_channels=out_channels_list[4], kernel_size=3, stride=stride_list[4], padding=1)
+        self.pool5 = nn.MaxPool3d(kernel_size=2, stride=2, padding=0)
+        #####################################################
+
         self.flatten = nn.Flatten()
         flattened_size = self._get_flattened_size(input_shape)
         
-        self.fc1 = nn.Linear(flattened_size, 256)
+        self.fc1 = nn.Linear(flattened_size, latent_dim)
         self.fc2 = nn.Linear(latent_dim, output_dim)
         
         self.dropout = nn.Dropout(p=dropout)
@@ -46,6 +50,10 @@ class CNN3D(nn.Module):
         x = self.pool1(F.relu(self.conv1(x)))
         x = self.pool2(F.relu(self.conv2(x)))
         x = self.pool3(F.relu(self.conv3(x)))
+        
+        # Pass through additional layers
+        x = self.pool4(F.relu(self.conv4(x)))
+        x = self.pool5(F.relu(self.conv5(x)))
         
         x = self.flatten(x)
         x = F.relu(self.fc1(x))
@@ -59,6 +67,11 @@ class CNN3D(nn.Module):
         x = self.pool1(F.relu(self.conv1(x)))
         x = self.pool2(F.relu(self.conv2(x)))
         x = self.pool3(F.relu(self.conv3(x)))
+        
+        # Pass through additional layers
+        x = self.pool4(F.relu(self.conv4(x)))
+        x = self.pool5(F.relu(self.conv5(x)))
+        
         x = self.flatten(x)
         return x.numel()
 
@@ -351,12 +364,13 @@ def main(which_data='t1_2mm', num_epochs=50, y_variable = 'TScore', train_from_s
         project=project_name,
         entity='yiyuwang1')
     print(f'run_name: {run.name}')
-    which_subset = 'all'
+    which_subset = '_cp'
     if 'ukb' in which_data:
         augmented_df = get_ukb_nifti_path(project_dir, create=False, which_subset=which_subset, which_res='2mm')
         print(augmented_df)
         print(f'resolution=2mm, which_subset={which_subset}')
-    else:    
+    else:
+        print(f"loading labels for {which_data}")
         demographics = pd.read_csv(f'{project_dir}/HEAL_labels/participants_demographics.csv')
         label_df = pd.read_csv(f'{project_dir}/HEAL_labels/labels.csv')
         label_df = label_df[label_df.session == 'baseline']
@@ -396,7 +410,7 @@ def main(which_data='t1_2mm', num_epochs=50, y_variable = 'TScore', train_from_s
                                 device=device)
         
         # save model
-        model_name = f'{project_dir}/models_save/cnn3d-{stride_list[0]}-{stride_list[1]}-{stride_list[2]}_outchannel-{out_channels_list[0]}-{out_channels_list[1]}-{out_channels_list[2]}_dropout-{dropout}_latentdim-{latent_dim}_regression_{which_data}_y-{y_variable}_subset-{which_subset}.pt'
+        model_name = f'{project_dir}/models_save/cnn3d-{stride_list[0]}-{stride_list[1]}-{stride_list[2]}_outchannel-{out_channels_list[0]}-{out_channels_list[1]}-{out_channels_list[2]}_dropout-{dropout}_latentdim-{latent_dim}_batch-{batch_size}_regression_{which_data}_y-{y_variable}_subset-{which_subset}.pt'
         print(f'Saving model to {model_name}')
         torch.save(trained_model.state_dict(), model_name)
         if test_split > 0:
@@ -421,25 +435,29 @@ def main(which_data='t1_2mm', num_epochs=50, y_variable = 'TScore', train_from_s
         else:
             # Dynamically compute the flattened size
             _, _, pretrained_data_shape = get_path_and_shape('ukb_t1', project_dir)
+            print("pretrained data shape:", pretrained_data_shape)
             output_dim = 1
             model = CNN3D(output_dim=output_dim, input_shape=pretrained_data_shape, stride_list=stride_list, out_channels_list=out_channels_list, dropout=dropout, latent_dim=latent_dim)
             model = model.to(device)  # Move model to GPU if available
-            
 
             count_params(model)
 
-            model.load_state_dict(torch.load(pretrained_model, map_location=torch.device('cpu')))
+            model.load_state_dict(torch.load(pretrained_model, map_location=device))
+            print(model)
             # get the new data shape
             _, _, data_shape = get_path_and_shape(which_data, project_dir)
+            print("new input data:",data_shape)
             model_size = CNN3D(output_dim=output_dim, input_shape=data_shape)
             flattened_size = model_size._get_flattened_size(data_shape)
             del model_size # delete to save memory
+            print("flattened new input data shape:", flattened_size)
 
             # replace the last fc layers with new input dim
-            trained_model = fine_tune_cnn3d(model, new_input_dim=flattened_size, new_output_dim=new_output_dim)
+            trained_model = fine_tune_cnn3d(model, new_input_dim=flattened_size, new_output_dim=new_output_dim, latent_dim=latent_dim)
             optimizer = optim.Adam(trained_model.parameters(), lr=0.001)
             print('load pretrained 3dcnn')
             count_params(trained_model)
+            print(trained_model)
 
             print('initial transfer performance without fine-tuning')
             evaluate_model(trained_model, test_loader, criterion, device)
@@ -448,7 +466,7 @@ def main(which_data='t1_2mm', num_epochs=50, y_variable = 'TScore', train_from_s
                                     val_loader, 
                                     criterion, 
                                     optimizer, 
-                                    num_epochs=100,
+                                    num_epochs=num_epochs,
                                     device=device)
             
             test_loss, test_r2, test_corr, test_outputs, test_labels = evaluate_model(fine_tune_model, test_loader, criterion, device)
@@ -458,36 +476,43 @@ def main(which_data='t1_2mm', num_epochs=50, y_variable = 'TScore', train_from_s
             # if test_labels > 64, then1, else 0
             test_groups = np.where(np.array(test_labels) >= auc_threshold, 1, 0)
             test_auc = roc_auc_score(test_groups, test_outputs)
+
             # save test_outputs, test_labels in a csv
             test_df = pd.DataFrame({'test_outputs': test_outputs, 'test_labels': test_labels})
             test_df.to_csv(f'{project_dir}/models_save/pretrained_cnn3d_regression_{which_data}_y-{y_variable}_test.csv', index=False)
             print(f'Test AUC: {test_auc:.4f}')
             wandb.log({'test_auc': test_auc})
+            print(test_df)
 
 
 if __name__ == '__main__':
         main(which_data = 'ukb_t1', 
-        num_epochs=100, 
-        y_variable='BMI',
+        num_epochs=200, 
+        y_variable='age',
         batch_size=8, 
         val_split=0.2, 
         test_split=0, 
         train_from_scratch = True, 
         pretrained_model=None,  
         auc_threshold=64,
-        stride_list = [2,2,2],
-        out_channels_list = [16, 32, 64], 
+        stride_list = [1,1,1,1,1],
+        out_channels_list = [16, 32, 64, 128, 256], 
         dropout=0.5,
         latent_dim=256,
         SEED=42)
 
 
-    # main(which_data = 't1_1mm', 
-    #     num_epochs=100, 
-    #     y_variable='TScore',
-    #     batch_size=16, 
-    #     val_split=0.2, 
-    #     test_split=0.1, 
-    #     train_from_scratch = False, 
-    #     pretrained_model='/home/yiyuw/projects/MRI_TransferLearning/models_save/cnn3d_regression_ukb_t1_y-BMI_subset-all.pt', 
-    #     auc_threshold=65)
+        # main(which_data = 't1_2mm', 
+        # num_epochs=100, 
+        # y_variable='TScore',
+        # batch_size=8, 
+        # val_split=0.2, 
+        # test_split=0.3, 
+        # train_from_scratch = False, 
+        # pretrained_model='/home/yiyuw/projects/MRI_TransferLearning/models_save/cnn3d-1-1-1_outchannel-16-32-64_dropout-0.5_latentdim-256_regression_ukb_t1_y-age_subset-all.pt',  
+        # auc_threshold=65,
+        # stride_list = [2,2,2,2,2],
+        # out_channels_list = [16, 32, 64, 128, 256], 
+        # dropout=0.5,
+        # latent_dim=256,
+        # SEED=42)
