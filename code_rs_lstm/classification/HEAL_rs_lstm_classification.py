@@ -20,6 +20,7 @@ from sklearn.metrics import roc_curve, roc_auc_score
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import re
 import math
@@ -38,7 +39,7 @@ from sklearn.model_selection import GroupShuffleSplit
 from tqdm import tqdm
 
 from torch.autograd import Variable
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, BatchSampler
 import torch.optim as optim
 torch.cuda.is_available()
 
@@ -95,7 +96,7 @@ class CustomRSFCMDataset(Dataset):
             y = self.target_transform(y)
         return X, y
     
-def ParcelFileToTensor(parcel_file_list, NROI, transform = None, network = None):
+def ParcelFileToTensor(parcel_file_list, NROI, transform = None, network = None, drop_network = False):
     """
     Convert pregenerated parcellation files to tensor
 
@@ -122,7 +123,12 @@ def ParcelFileToTensor(parcel_file_list, NROI, transform = None, network = None)
             if network:
                 x_cols = [col for col in par_df.columns if 'Networks' in col]
                 zero_cols = [col for col in x_cols if (network in col)]
-                par_df[zero_cols]=0
+                if drop_network:
+                    print(f'Dropping {network} network')
+                    par_df.drop(zero_cols, axis=1, inplace=True)
+                else:
+                    print(f"Lesioning {network} network")
+                    par_df[zero_cols]=0
                 
             this_x = par_df.iloc[:,1:NROI+1].astype(float).values
             # Transform:
@@ -143,9 +149,9 @@ import torch.optim as optim
 from sklearn.metrics import roc_auc_score, accuracy_score
 
 class LSTMWithTransformer(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_heads, num_layers, dropout=0.2, dropout_layer=0.2):
+    def __init__(self, input_dim, hidden_dim, num_lstm_layers, output_dim, num_heads, num_layers, dropout=0.2, dropout_layer=0.2):
         super(LSTMWithTransformer, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True, dropout=dropout)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_lstm_layers, batch_first=True, dropout=dropout)
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads),
             num_layers=num_layers
@@ -170,9 +176,9 @@ class LSTMWithTransformer(nn.Module):
         return output
     
 class BiLSTMWithTransformer(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_heads, num_layers, dropout=0.2, dropout_layer=0.2):
+    def __init__(self, input_dim, hidden_dim, num_lstm_layers, output_dim, num_heads, num_layers, dropout=0.2, dropout_layer=0.2):
         super(BiLSTMWithTransformer, self).__init__()
-        self.bilstm = nn.LSTM(input_dim, hidden_dim, batch_first=True, bidirectional=True, dropout=dropout)
+        self.bilstm = nn.LSTM(input_dim, hidden_dim, num_lstm_layers, batch_first=True, bidirectional=True, dropout=dropout)
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=hidden_dim*2, nhead=num_heads),
             num_layers=num_layers
@@ -197,9 +203,9 @@ class BiLSTMWithTransformer(nn.Module):
     
         
 class LSTMWithAttention(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2, dropout_layer=0.2):
+    def __init__(self, input_dim, hidden_dim, num_lstm_layers, output_dim, dropout=0.2, dropout_layer=0.2):
         super(LSTMWithAttention, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True, dropout=dropout)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_lstm_layers, batch_first=True, dropout=dropout)
         self.attention = nn.Linear(hidden_dim, 1)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.dropout_layer = nn.Dropout(dropout_layer)
@@ -216,9 +222,9 @@ class LSTMWithAttention(nn.Module):
         return output
     
 class BiLSTMWithAttention(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2, dropout_layer=0.2):
+    def __init__(self, input_dim, hidden_dim, num_lstm_layers, output_dim, dropout=0.2, dropout_layer=0.2):
         super(BiLSTMWithAttention, self).__init__()
-        self.bilstm = nn.LSTM(input_dim, hidden_dim, batch_first=True, bidirectional=True, dropout=dropout)
+        self.bilstm = nn.LSTM(input_dim, hidden_dim, num_lstm_layers, batch_first=True, bidirectional=True, dropout=dropout)
         self.attention = nn.Linear(hidden_dim * 2, 1)  # *2 for bidirectional
         self.fc = nn.Linear(hidden_dim * 2, output_dim)
         self.dropout_layer = nn.Dropout(dropout_layer)
@@ -235,9 +241,9 @@ class BiLSTMWithAttention(nn.Module):
         return output    
 
 class LSTN(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, dropout=0.2):
+    def __init__(self, input_size, hidden_size, num_lstm_layers, output_size, dropout=0.2):
         super(LSTN, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True, bidirectional=False, dropout=dropout)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_lstm_layers, batch_first=True, bidirectional=False, dropout=dropout)
         self.fc = nn.Linear(hidden_size, output_size)
     
     def forward(self, x):
@@ -248,21 +254,73 @@ class LSTN(nn.Module):
 
 
 class BLSTN(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, dropout=0.2):
+    def __init__(self, input_size, hidden_size, num_lstm_layers, output_size, dropout=0.2):
         super(BLSTN, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True, bidirectional=True, dropout=dropout)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_lstm_layers, batch_first=True, bidirectional=True, dropout=dropout)
         self.fc = nn.Linear(hidden_size * 2, output_size)  # Multiply hidden_size by 2 for bidirectional LSTM
     
     def forward(self, x):
         _, (h, _) = self.lstm(x)
         out = self.fc(torch.cat((h[-2], h[-1]), dim=1))  # Concatenate the hidden states from both directions
         return out
-    
-  
-    
+
+def my_binarize(y, threshold=65):
+    y = np.array(y)
+    y_bin = np.zeros(len(y))
+    y_bin[y >= threshold] = 1
+    return y_bin
+
+def log_my_plot(y_test, y_pred, Tscore, y_pred_sigmoid):
+    from sklearn.metrics import roc_curve, auc
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    # confusion matrix
+    from sklearn.metrics import confusion_matrix
+    cm = confusion_matrix(y_test, y_pred)
+    sns.heatmap(cm, annot=True, cmap='BuPu', fmt='d', xticklabels=['Low PainIn', 'High PainIn'], yticklabels=['Low PainIn', 'High PainIn'],annot_kws={"size": 16})
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.title('Confusion Matrix')
+    wandb.log({"confusion_matrix_plot": wandb.Image(plt)})
+    plt.close()
 
 
-def train_LSTN(model_name, X_train, y_train, X_test, y_test, input_size, hidden_size, output_size, n_epochs, batch_size, lr, y_variable, save_model_dir, dropout=0.2, dropout_layer=0.2, num_heads=4, num_layers=2, SEED=42):
+    # calculate accuracy:
+    accuracy = np.mean(y_pred == y_test)
+    print(f'Accuracy: {accuracy:.4f}')
+
+    print('chance level: ', 1 - np.mean(y_test))
+    # calculate sensitivity and specificity
+    TP = cm[1,1]
+    TN = cm[0,0]
+    FP = cm[0,1]
+    FN = cm[1,0]
+    sensitivity = TP / (TP + FN)
+    specificity = TN / (TN + FP)
+    print(f'Sensitivity: {sensitivity:.4f}')
+    print(f'Specificity: {specificity:.4f}')
+
+    # Compute the ROC curve and AUC
+    fpr, tpr, _ = roc_curve(y_test, y_pred_sigmoid)
+    roc_auc = auc(fpr, tpr)
+
+    # Create the AUC plot
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic')
+    plt.legend(loc="lower right")
+
+    # Log the AUC plot to WandB
+    wandb.log({"AUC_plot": wandb.Image(plt)})
+    plt.close()  
+    
+
+def train_LSTN(model_name, train_dataloader, test_dataloader, input_size, hidden_size, num_lstm_layers, output_size, n_epochs, batch_size, lr, y_variable, save_model_dir, dropout=0.2, dropout_layer=0.2, num_heads=4, num_layers=2, SEED=42):
     # set initialization
     torch.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)
@@ -273,30 +331,26 @@ def train_LSTN(model_name, X_train, y_train, X_test, y_test, input_size, hidden_
     torch.backends.cudnn.benchmark = False
 
     if model_name == 'LSTM':
-        model = LSTN(input_size, hidden_size, output_size, dropout=dropout)
+        model = LSTN(input_size, hidden_size, num_lstm_layers, output_size, dropout=dropout)
     elif model_name == 'BLSTM':
-        model = BLSTN(input_size, hidden_size, output_size, dropout=dropout)
+        model = BLSTN(input_size, hidden_size, num_lstm_layers, output_size, dropout=dropout)
     elif model_name == 'LSTMWithAttention':
-        model = LSTMWithAttention(input_size, hidden_size, output_size, dropout=dropout, dropout_layer=dropout_layer)
+        model = LSTMWithAttention(input_size, hidden_size, num_lstm_layers, output_size, dropout=dropout, dropout_layer=dropout_layer)
     elif model_name == 'BiLSTMWithAttention':
 
-        model = BiLSTMWithAttention(input_size, hidden_size, output_size, dropout=dropout, dropout_layer=dropout_layer)
+        model = BiLSTMWithAttention(input_size, hidden_size, num_lstm_layers, output_size, dropout=dropout, dropout_layer=dropout_layer)
     elif model_name == 'LSTMWithTransformer':
-        model = LSTMWithTransformer(input_size, hidden_size, output_size, num_heads=num_heads, num_layers=num_layers, dropout=dropout, dropout_layer=dropout_layer)
+        model = LSTMWithTransformer(input_size, hidden_size, num_lstm_layers, output_size, num_heads=num_heads, num_layers=num_layers, dropout=dropout, dropout_layer=dropout_layer)
     elif model_name == 'BiLSTMWithTransformer':
-        model = BiLSTMWithTransformer(input_size, hidden_size, output_size, num_heads=num_heads, num_layers=num_layers, dropout=dropout, dropout_layer=dropout_layer)    
+        model = BiLSTMWithTransformer(input_size, hidden_size, num_lstm_layers, output_size, num_heads=num_heads, num_layers=num_layers, dropout=dropout, dropout_layer=dropout_layer)    
     else:
         raise ValueError("model_name must be: 'LSTM', 'BLSTM', 'LSTMWithAttention', 'BiLSTMWithAttention', 'LSTMWithTransformer', 'BiLSTMWithTransformer' ")    
     
 
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
-    train_dataset = CustomRSFCMDataset(X_train, y_train, transform=None, target_transform=None)
-    test_dataset = CustomRSFCMDataset(X_test, y_test, transform=None, target_transform=None)
-    
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_dataloader = DataLoader(test_dataset, batch_size=len(y_test), shuffle=False)
+
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -305,7 +359,7 @@ def train_LSTN(model_name, X_train, y_train, X_test, y_test, input_size, hidden_
     
     test_auc_list = []
     test_accuracy_list = []
-
+    y_preds_list, y_preds_prob_list, y_train_list = [], [], []
     for epoch in range(n_epochs):
         model.train()
         train_loss = 0.0
@@ -318,21 +372,26 @@ def train_LSTN(model_name, X_train, y_train, X_test, y_test, input_size, hidden_
             optimizer.zero_grad()
             
             outputs = model(X.float())
-            loss = criterion(outputs.squeeze(), y.float())
+            loss = criterion(outputs, y)
             loss.backward()
             optimizer.step()
             
             train_loss += loss.item() * X.size(0)
 
-            if np.unique(y.detach().cpu().numpy()).shape[0]>1:
-                train_auc += roc_auc_score(y.detach().cpu().numpy(), torch.sigmoid(outputs).detach().cpu().numpy())
-                
-            # train_auc += roc_auc_score(y.detach().cpu().numpy(), torch.sigmoid(outputs).detach().cpu().numpy())
-            train_accuracy += accuracy_score(y.detach().cpu().numpy(), torch.round(torch.sigmoid(outputs)).detach().cpu().numpy())
-        
+            # Probability for class 1 (positive class)
+            probas_class_1 = F.softmax(outputs, dim=1)[:, 1]  # Extract probability for class 1
+            y_preds_list.append(torch.argmax(outputs, dim=1).detach().cpu().numpy())
+            y_preds_prob_list.append(probas_class_1.detach().cpu().numpy())
+            y_train_list.append(y.detach().cpu().numpy())
+
+        y_preds_list_flattened = [item for sublist in y_preds_list for item in sublist]
+        y_preds_prob_list_flattened = [item for sublist in y_preds_prob_list for item in sublist]
+        y_train_list_flattened = [item for sublist in y_train_list for item in sublist]
+
+        train_auc = roc_auc_score(y_train_list_flattened, y_preds_prob_list_flattened)
+        train_accuracy = accuracy_score(y_train_list_flattened, y_preds_list_flattened)
         train_loss /= len(train_dataloader)
-        train_auc /= len(train_dataloader)
-        train_accuracy /= len(train_dataloader)
+        
         
         model.eval()
         test_loss = 0.0
@@ -346,20 +405,22 @@ def train_LSTN(model_name, X_train, y_train, X_test, y_test, input_size, hidden_
                 
                 outputs = model(X.float())
                 
-                loss = criterion(outputs.squeeze(), y.float())
+                loss = criterion(outputs, y)
                 
                 test_loss += loss.item() * X.size(0)
-                test_auc += roc_auc_score(y.detach().cpu().numpy(), torch.sigmoid(outputs).detach().cpu().numpy())
-                test_accuracy += accuracy_score(y.detach().cpu().numpy(), torch.round(torch.sigmoid(outputs)).detach().cpu().numpy())
+                probas_class_1 = F.softmax(outputs, dim=1)[:, 1]  # Extract probability for class 1
+    
+                test_auc += roc_auc_score(y.detach().cpu().numpy(), probas_class_1.detach().cpu().numpy())
+                test_accuracy += accuracy_score(y.detach().cpu().numpy(), torch.argmax(outputs, dim=1).cpu().numpy())
 
         # save for debugging
-        test_df['y_pred'] = outputs.detach().cpu().numpy()        
-        test_df['y_pred_sigmoid'] = torch.sigmoid(outputs).detach().cpu().numpy()
+        test_df['y_pred'] = torch.argmax(outputs, dim=1).cpu().numpy()      
+        test_df['y_pred_prob'] = F.softmax(outputs, dim=1)[:, 1].cpu().numpy()
         test_df['y'] = y.detach().cpu().numpy()
         test_df.to_csv(f'{save_model_dir}/test_df_pred_epoch-{epoch+1}.csv', index=False)
         # save the model
         if (epoch+1) % 20 == 0:
-            results_file_name = f'{save_model_dir}/model-{model_name}_{ROI_scheme}_hidden-{hidden_size}_batch-{batch_size}_lr-{lr}_epoch-{epoch+1}_dropout-{dropout}_seed-{SEED}'
+            results_file_name = f'{save_model_dir}/model-{model_name}_ROI-{ROI_scheme}_hidden-{hidden_size}_batch-{batch_size}_lr-{lr}_epoch-{epoch+1}_dropout-{dropout}_dropoutlayer-{dropout_layer}_heads-{num_heads}_layers-{num_layers}_seed-{SEED}'
             torch.save(model.state_dict(), f'{results_file_name}.pt')
 
         test_loss /= len(test_dataloader)
@@ -384,6 +445,8 @@ def train_LSTN(model_name, X_train, y_train, X_test, y_test, input_size, hidden_
     print(f"average test auc: {np.mean(test_auc_list):.4f}")
     print(f"best test accuracy: {max(test_accuracy_list):.4f}")
     print(f"average test accuracy: {np.mean(test_accuracy_list):.4f}")
+
+    log_my_plot(y_test=test_df['y'],Tscore=test_df['TScore'], y_pred=test_df['y_pred'], y_pred_sigmoid=test_df['y_pred_prob'])
  
     return test_auc_list, test_accuracy_list, model
 
@@ -405,8 +468,11 @@ def count_params(model):
     print(f"Total Parameters: {total_params}")
     print(f"Trainable Parameters: {trainable_params}")
 
+
 def main(
+    output_size = 2,
     hidden_size = 128,
+    num_lstm_layers = 2,
     batch_size = 16,
     model_name = 'LSTN',
     ROI_scheme = 'schaefer100',
@@ -459,7 +525,7 @@ def main(
     # choose run or runs:
     augmented_df = augmented_df.loc[augmented_df['run'].isin(['1', '2'])]        
     augmented_df.reset_index(drop=True, inplace=True)
-    
+    augmented_df.to_csv(f'{project_dir}/HEAL_augmented_df.csv', index=False)
     cv_test_auc_list, cv_test_accuracy_list = [], []
 
     # make X
@@ -467,7 +533,7 @@ def main(
     for i, row in augmented_df.iterrows():
         f = augmented_df.loc[i, 'file']
         X.append(f)
-        y.append(augmented_df.loc[i, 'group'])
+        y.append(augmented_df.loc[i, y_variable])
     y = np.array(y)
 
     
@@ -480,8 +546,8 @@ def main(
     
 
     # Initialize a new wandb run
-    project_name = "heal_rs_lstm_experiment_v8"
-    config_args = {'hidden_size': hidden_size, 'batch_size': batch_size, 'model_name': model_name, 'ROI_scheme': ROI_scheme, 'lr': lr, 'num_heads': num_heads, 'num_layers': num_layers, 'dropout': dropout, 'dropout_layer': dropout_layer, 'SEED': SEED, 'n_ep': n_ep}
+    project_name = "heal_rs_lstm_classification_v4"
+    config_args = {'num_lstm_layers': num_lstm_layers, 'y_variable': y_variable, 'hidden_size': hidden_size, 'batch_size': batch_size, 'model_name': model_name, 'ROI_scheme': ROI_scheme, 'lr': lr, 'num_heads': num_heads, 'num_layers': num_layers, 'dropout': dropout, 'dropout_layer': dropout_layer, 'SEED': SEED, 'n_ep': n_ep}
     run = wandb.init(config=config_args,
         project=project_name,
         entity='yiyuwang1')
@@ -491,7 +557,9 @@ def main(
 
     # split based on participants
     subjects_list = np.unique(augmented_df['subject_id'].values).tolist()
-    train_sub_idx, test_sub_idx = train_test_split(subjects_list, test_size=0.3, random_state=SEED)
+    train_sub_idx, test_sub_idx = train_test_split(subjects_list, test_size=0.2, random_state=SEED)
+    
+    # Creete datasets and dataloaders
     # find the indices of the subjects in the augmented_df
     train_idx = augmented_df[augmented_df['subject_id'].isin(train_sub_idx)].index
     test_idx = augmented_df[augmented_df['subject_id'].isin(test_sub_idx)].index
@@ -503,23 +571,36 @@ def main(
     # make X_train and X_test
     X_train = ParcelFileToTensor(X_train_sub, NROI)
     X_test = ParcelFileToTensor(X_test_sub, NROI)
+    input_size = X_train.shape[2]
+    print(f'input_size: {input_size}')
+    print(X_train.shape, X_test.shape)
 
     y_train = torch.tensor(y[train_idx.astype(int)])
     y_test = torch.tensor(y[test_idx.astype(int)])
+
+    train_dataset = CustomRSFCMDataset(X_train, y_train, transform=None, target_transform=None)
+    test_dataset = CustomRSFCMDataset(X_test, y_test, transform=None, target_transform=None)
+    
+    # Step 3: Create a DataLoader 
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_dataloader = DataLoader(test_dataset, batch_size=len(y_test), shuffle=False)
 
     # save the train_df, and test_df
     train_df = augmented_df.loc[train_idx].to_csv(f'{save_model_dir}/train_df.csv', index=False)
     test_df = augmented_df.loc[test_idx].to_csv(f'{save_model_dir}/test_df.csv', index=False)
 
-    test_auc_list, test_accuracy_list, model = train_LSTN(model_name, X_train, y_train, X_test, y_test, input_size=NROI, hidden_size=hidden_size, output_size=1, n_epochs=n_ep, batch_size=batch_size, lr=lr, y_variable='group', save_model_dir=save_model_dir, dropout=dropout, dropout_layer=dropout_layer, num_heads=num_heads, num_layers=num_layers, SEED=SEED) 
+    test_auc_list, test_accuracy_list, model = train_LSTN(model_name, train_dataloader, test_dataloader, input_size=input_size, hidden_size=hidden_size, num_lstm_layers = num_lstm_layers, output_size=output_size, n_epochs=n_ep, batch_size=batch_size, lr=lr, y_variable='group', save_model_dir=save_model_dir, dropout=dropout, dropout_layer=dropout_layer, num_heads=num_heads, num_layers=num_layers, SEED=SEED) 
 
-    results_file_name = f'{save_model_dir}/model-{model_name}_{ROI_scheme}_hidden-{hidden_size}_batch-{batch_size}_lr-{lr}_epoch-{n_ep}_dropout-{dropout}_dropoutlayer-{dropout_layer}_heads-{num_heads}_layers-{num_layers}_seed-{SEED}'
+    results_file_name = f'{save_model_dir}/model-{model_name}_lstmlayer-{num_lstm_layers}_ROI-{ROI_scheme}_hidden-{hidden_size}_batch-{batch_size}_lr-{lr}_epoch-{n_ep}_dropout-{dropout}_dropoutlayer-{dropout_layer}_heads-{num_heads}_layers-{num_layers}_seed-{SEED}'
     # torch.save(model.state_dict(), f'{results_file_name}.pt')
     cv_test_df = pd.DataFrame({'auc':test_auc_list, 'accuracy':test_accuracy_list, 'epoch':range(len(test_auc_list))}).to_csv(f'{results_file_name}.csv')
 
 
     print(f"total auc: {np.mean(test_auc_list):.4f}")
     print(f"total accuracy: {np.mean(test_accuracy_list):.4f}")
+
+
+
 
     # python HEAL_rs_lstn.py 'schaefer100' 128 32 'LSTMWithTransformer' 48
     wandb.finish()
@@ -540,37 +621,42 @@ if __name__ == "__main__":
     # 'SEED': [42, 5],
     # }
     params_dict = {
-    'hidden_size': [256, 128],
-    'batch_size': [16, 8],
-    'model_name': ['LSTMWithTransformer', 'BiLSTMWithTransformer'],
-    'ROI_scheme': ['schaefer400'],
-    'lr': [0.00001],
+    'hidden_size': [256],
+    'num_lstm_layers': [2], 
+    'batch_size': [16],
+    'model_name': ['LSTMWithTransformer'],
+    'ROI_scheme': ['schaefer200'],
+    'lr': [0.0001],
     'num_heads': [8],
     'num_layers': [2],
-    'dropout': [0],
-    'dropout_layer': [0.5],
-    'SEED': [42],
+    'dropout': [0.5],
+    'dropout_layer': [0.2],
+    'SEED': [30, 35, 42, 50, 60, 70, 80, 88, 90, 100],
+    'y_variable': ['group']
     }
-
-
+    print("this is a classifcation task. Check the output size is the number of classes...")
+    output_size = 2
     from itertools import product
     total_iteration = len(list(product(*params_dict.values())))
     print(f'Number of iterations: {total_iteration}')
 
     for i, params in enumerate(product(*params_dict.values())):
+    
         print(f'---------Iteration {i+1} / {total_iteration} --------')
-        hidden_size, batch_size, model_name, ROI_scheme, lr, num_heads, num_layers, dropout, dropout_layer, SEED = params
-        print(f'hidden_size: {hidden_size}, batch_size: {batch_size}, model_name: {model_name}, ROI_scheme: {ROI_scheme}, lr: {lr}, num_heads: {num_heads}, num_layers: {num_layers}, dropout: {dropout}, dropout_layer: {dropout_layer}, SEED: {SEED}')
+        hidden_size, num_lstm_layers, batch_size, model_name, ROI_scheme, lr, num_heads, num_layers, dropout, dropout_layer, SEED, y_variable = params
+        print(f'y_variable: {y_variable}, output_size: {output_size}, hidden_size: {hidden_size}, num_lstm_layers:{num_lstm_layers}, batch_size: {batch_size}, model_name: {model_name}, ROI_scheme: {ROI_scheme}, lr: {lr}, num_heads: {num_heads}, num_layers: {num_layers}, dropout: {dropout}, dropout_layer: {dropout_layer}, SEED: {SEED}')
         
 
         main(
+        output_size = 2,
         hidden_size = hidden_size,
+        num_lstm_layers = num_lstm_layers,
         batch_size = batch_size,
         model_name = model_name,
         ROI_scheme = ROI_scheme,
-        n_ep = 200,
+        n_ep = 100,
         lr=lr, 
-        y_variable='group', 
+        y_variable=y_variable, 
         dropout=dropout, 
         dropout_layer=dropout_layer, 
         num_heads=num_heads, 
